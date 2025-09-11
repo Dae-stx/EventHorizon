@@ -1,5 +1,6 @@
-;; EventHorizon - Decentralized Prediction Market Platform with Advanced AMM
+;; EventHorizon - Decentralized Prediction Market Platform with Advanced AMM and Oracle Integration
 ;; A platform for creating and trading outcome shares using automated market maker algorithms
+;; Now with external oracle integration for automatic market resolution
 
 ;; Constants
 (define-constant CONTRACT_OWNER tx-sender)
@@ -17,15 +18,48 @@
 (define-constant ERR_SLIPPAGE_EXCEEDED (err u111))
 (define-constant ERR_MINIMUM_LIQUIDITY (err u112))
 (define-constant ERR_DIVISION_BY_ZERO (err u113))
+(define-constant ERR_ORACLE_NOT_FOUND (err u114))
+(define-constant ERR_ORACLE_NOT_AUTHORIZED (err u115))
+(define-constant ERR_ORACLE_ALREADY_EXISTS (err u116))
+(define-constant ERR_INVALID_ORACLE_DATA (err u117))
+(define-constant ERR_ORACLE_DATA_TOO_OLD (err u118))
+(define-constant ERR_ORACLE_RESOLUTION_PENDING (err u119))
+(define-constant ERR_INVALID_STRING_LENGTH (err u120))
+(define-constant ERR_INVALID_PRINCIPAL (err u121))
 
 ;; AMM Constants
 (define-constant MINIMUM_LIQUIDITY u100000000) ;; 100 STX minimum liquidity per side
 (define-constant PRECISION u1000000) ;; 6 decimal places for calculations
 (define-constant MAX_SLIPPAGE u5000) ;; 50% maximum slippage protection
+(define-constant ORACLE_DATA_VALIDITY_BLOCKS u144) ;; 24 hours validity for oracle data
 
 ;; Data Variables
 (define-data-var market-counter uint u0)
+(define-data-var oracle-counter uint u0)
 (define-data-var platform-fee-rate uint u250) ;; 2.5% fee (250 basis points)
+
+;; Oracle Data Maps
+(define-map oracles uint {
+    name: (string-ascii 64),
+    operator: principal,
+    active: bool,
+    created-at: uint,
+    total-resolutions: uint
+})
+
+(define-map oracle-data { oracle-id: uint, data-key: (string-ascii 128) } {
+    value: (string-ascii 256),
+    timestamp: uint,
+    block-height: uint,
+    verified: bool
+})
+
+(define-map market-oracles uint {
+    oracle-id: uint,
+    data-key: (string-ascii 128),
+    resolution-criteria: (string-ascii 256),
+    auto-resolve: bool
+})
 
 ;; Data Maps
 (define-map markets uint {
@@ -40,7 +74,8 @@
     resolved: bool,
     outcome: (optional bool),
     resolver: (optional principal),
-    k-constant: uint ;; AMM constant product k = x * y
+    k-constant: uint, ;; AMM constant product k = x * y
+    oracle-resolved: bool
 })
 
 (define-map user-positions { market-id: uint, user: principal } {
@@ -51,9 +86,24 @@
 
 (define-map market-fees uint uint) ;; market-id -> accumulated fees
 
+;; Oracle authorization map
+(define-map authorized-oracles principal bool)
+
 ;; Read-only functions
 (define-read-only (get-market (market-id uint))
     (map-get? markets market-id)
+)
+
+(define-read-only (get-oracle (oracle-id uint))
+    (map-get? oracles oracle-id)
+)
+
+(define-read-only (get-oracle-data (oracle-id uint) (data-key (string-ascii 128)))
+    (map-get? oracle-data { oracle-id: oracle-id, data-key: data-key })
+)
+
+(define-read-only (get-market-oracle (market-id uint))
+    (map-get? market-oracles market-id)
 )
 
 (define-read-only (get-user-position (market-id uint) (user principal))
@@ -67,8 +117,16 @@
     (var-get market-counter)
 )
 
+(define-read-only (get-oracle-count)
+    (var-get oracle-counter)
+)
+
 (define-read-only (get-platform-fee-rate)
     (var-get platform-fee-rate)
+)
+
+(define-read-only (is-oracle-authorized (oracle-operator principal))
+    (default-to false (map-get? authorized-oracles oracle-operator))
 )
 
 ;; Simple AMM price calculation helper (internal)
@@ -78,11 +136,15 @@
         (let (
             (k-constant (* pool-in pool-out))
             (new-pool-in (+ pool-in amount-in))
-            (new-pool-out (/ k-constant new-pool-in))
         )
-            (if (> new-pool-out pool-out)
+            (if (is-eq new-pool-in u0)
                 u0
-                (- pool-out new-pool-out)
+                (let ((new-pool-out (/ k-constant new-pool-in)))
+                    (if (> new-pool-out pool-out)
+                        u0
+                        (- pool-out new-pool-out)
+                    )
+                )
             )
         )
     )
@@ -94,7 +156,7 @@
         (pool-in (if bet-yes yes-pool no-pool))
         (pool-out (if bet-yes no-pool yes-pool))
         (fee-amount (/ (* amount-in (var-get platform-fee-rate)) u10000))
-        (amount-in-after-fee (- amount-in fee-amount))
+        (amount-in-after-fee (if (>= amount-in fee-amount) (- amount-in fee-amount) u0))
         (shares-out (calculate-shares-internal pool-in pool-out amount-in-after-fee))
     )
         (if (and (> amount-in u0) (> shares-out u0))
@@ -116,13 +178,15 @@
             (let (
                 (price-before (/ (* pool-out PRECISION) total-pool))
                 (shares-out (calculate-shares-internal pool-in pool-out amount-in))
-                (new-pool-out (- pool-out shares-out))
+                (new-pool-out (if (>= pool-out shares-out) (- pool-out shares-out) u0))
                 (new-total (+ (+ pool-in amount-in) new-pool-out))
                 (price-after (if (is-eq new-total u0) u0 (/ (* new-pool-out PRECISION) new-total)))
             )
                 (if (is-eq price-before u0)
                     (ok u0)
-                    (ok (/ (* (- price-before price-after) u10000) price-before))
+                    (ok (if (>= price-before price-after)
+                            (/ (* (- price-before price-after) u10000) price-before)
+                            u0))
                 )
             )
         )
@@ -135,9 +199,9 @@
         (pool-in (if bet-yes yes-pool no-pool))
         (pool-out (if bet-yes no-pool yes-pool))
         (fee-amount (/ (* amount-in (var-get platform-fee-rate)) u10000))
-        (amount-in-after-fee (- amount-in fee-amount))
+        (amount-in-after-fee (if (>= amount-in fee-amount) (- amount-in fee-amount) u0))
         (expected-output (calculate-shares-internal pool-in pool-out amount-in-after-fee))
-        (slippage-factor (- u10000 slippage-tolerance))
+        (slippage-factor (if (>= u10000 slippage-tolerance) (- u10000 slippage-tolerance) u0))
         (minimum-output (/ (* expected-output slippage-factor) u10000))
     )
         (if (> expected-output u0)
@@ -174,24 +238,125 @@
     (and (>= (len desc) min-len) (<= (len desc) max-len))
 )
 
-;; Public functions
+(define-private (validate-oracle-name (name (string-ascii 64)))
+    (and (>= (len name) u1) (<= (len name) u64))
+)
+
+(define-private (validate-data-key (key (string-ascii 128)))
+    (and (>= (len key) u1) (<= (len key) u128))
+)
+
+(define-private (validate-oracle-value (value (string-ascii 256)))
+    (and (>= (len value) u1) (<= (len value) u256))
+)
+
+(define-private (validate-resolution-criteria (criteria (string-ascii 256)))
+    (and (>= (len criteria) u1) (<= (len criteria) u256))
+)
+
+;; Enhanced principal validation helper
+(define-private (validate-principal (principal-to-check principal))
+    ;; Basic check to ensure the principal is not a null/zero principal
+    ;; In Stacks, we can't easily check for "null" principals, but we can validate
+    ;; that it's not the same as a known invalid state
+    (not (is-eq principal-to-check 'ST000000000000000000002AMW42H))
+)
+
+;; Oracle Management Functions
+(define-public (register-oracle (name (string-ascii 64)))
+    (let (
+        (oracle-id (+ (var-get oracle-counter) u1))
+        (validated-name (unwrap! (as-max-len? name u64) ERR_INVALID_STRING_LENGTH))
+    )
+        ;; Validate inputs
+        (asserts! (validate-oracle-name validated-name) ERR_INVALID_STRING_LENGTH)
+        (asserts! (validate-principal tx-sender) ERR_INVALID_PRINCIPAL)
+        (asserts! (is-oracle-authorized tx-sender) ERR_ORACLE_NOT_AUTHORIZED)
+        
+        ;; Create oracle
+        (map-set oracles oracle-id {
+            name: validated-name,
+            operator: tx-sender,
+            active: true,
+            created-at: stacks-block-height,
+            total-resolutions: u0
+        })
+        
+        (var-set oracle-counter oracle-id)
+        (ok oracle-id)
+    )
+)
+
+(define-public (update-oracle-data (oracle-id uint) (data-key (string-ascii 128)) (value (string-ascii 256)))
+    (let (
+        (oracle-info (unwrap! (map-get? oracles oracle-id) ERR_ORACLE_NOT_FOUND))
+        (validated-key (unwrap! (as-max-len? data-key u128) ERR_INVALID_STRING_LENGTH))
+        (validated-value (unwrap! (as-max-len? value u256) ERR_INVALID_STRING_LENGTH))
+    )
+        ;; Validate inputs and authorization
+        (asserts! (validate-data-key validated-key) ERR_INVALID_STRING_LENGTH)
+        (asserts! (validate-oracle-value validated-value) ERR_INVALID_STRING_LENGTH)
+        (asserts! (validate-principal tx-sender) ERR_INVALID_PRINCIPAL)
+        (asserts! (is-eq tx-sender (get operator oracle-info)) ERR_ORACLE_NOT_AUTHORIZED)
+        (asserts! (get active oracle-info) ERR_ORACLE_NOT_AUTHORIZED)
+        
+        ;; Update oracle data
+        (map-set oracle-data { oracle-id: oracle-id, data-key: validated-key } {
+            value: validated-value,
+            timestamp: stacks-block-height,
+            block-height: stacks-block-height,
+            verified: true
+        })
+        
+        (ok true)
+    )
+)
+
+(define-public (authorize-oracle (oracle-operator principal))
+    (begin
+        ;; Enhanced validation for principal parameter
+        (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_NOT_AUTHORIZED)
+        (asserts! (validate-principal oracle-operator) ERR_INVALID_PRINCIPAL)
+        ;; Additional check to prevent authorizing the same principal multiple times
+        (asserts! (not (is-oracle-authorized oracle-operator)) ERR_ORACLE_ALREADY_EXISTS)
+        
+        (map-set authorized-oracles oracle-operator true)
+        (ok true)
+    )
+)
+
+(define-public (revoke-oracle-authorization (oracle-operator principal))
+    (begin
+        ;; Enhanced validation for principal parameter
+        (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_NOT_AUTHORIZED)
+        (asserts! (validate-principal oracle-operator) ERR_INVALID_PRINCIPAL)
+        ;; Check that the oracle is currently authorized before revoking
+        (asserts! (is-oracle-authorized oracle-operator) ERR_ORACLE_NOT_FOUND)
+        
+        (map-delete authorized-oracles oracle-operator)
+        (ok true)
+    )
+)
+
+;; Market Creation with Oracle Integration
 (define-public (create-market (title (string-ascii 256)) (description (string-ascii 1024)) (duration-blocks uint) (initial-liquidity uint))
     (let (
         (market-id (+ (var-get market-counter) u1))
         (expiry-block (+ stacks-block-height duration-blocks))
         (resolution-block (+ expiry-block u144)) ;; 24 hours after expiry for resolution
-        (validated-title (unwrap! (as-max-len? title u256) ERR_INVALID_AMOUNT))
-        (validated-description (unwrap! (as-max-len? description u1024) ERR_INVALID_AMOUNT))
+        (validated-title (unwrap! (as-max-len? title u256) ERR_INVALID_STRING_LENGTH))
+        (validated-description (unwrap! (as-max-len? description u1024) ERR_INVALID_STRING_LENGTH))
         (pool-amount (/ initial-liquidity u2))
         (initial-k (* pool-amount pool-amount))
     )
         ;; Comprehensive input validation
         (asserts! (> duration-blocks u0) ERR_INVALID_AMOUNT)
-        (asserts! (validate-string-length validated-title u1 u256) ERR_INVALID_AMOUNT)
-        (asserts! (validate-description-length validated-description u1 u1024) ERR_INVALID_AMOUNT)
+        (asserts! (validate-string-length validated-title u1 u256) ERR_INVALID_STRING_LENGTH)
+        (asserts! (validate-description-length validated-description u1 u1024) ERR_INVALID_STRING_LENGTH)
         (asserts! (validate-amount initial-liquidity) ERR_INVALID_AMOUNT)
         (asserts! (>= initial-liquidity MINIMUM_LIQUIDITY) ERR_MINIMUM_LIQUIDITY)
         (asserts! (is-eq (mod initial-liquidity u2) u0) ERR_INVALID_AMOUNT) ;; Must be even for balanced pools
+        (asserts! (validate-principal tx-sender) ERR_INVALID_PRINCIPAL)
         
         ;; Transfer initial liquidity from creator
         (try! (stx-transfer? initial-liquidity tx-sender (as-contract tx-sender)))
@@ -209,7 +374,8 @@
             resolved: false,
             outcome: none,
             resolver: none,
-            k-constant: initial-k
+            k-constant: initial-k,
+            oracle-resolved: false
         })
         
         (var-set market-counter market-id)
@@ -217,6 +383,87 @@
     )
 )
 
+;; Create market with oracle integration
+(define-public (create-oracle-market (title (string-ascii 256)) (description (string-ascii 1024)) (duration-blocks uint) (initial-liquidity uint) (oracle-id uint) (data-key (string-ascii 128)) (resolution-criteria (string-ascii 256)) (auto-resolve bool))
+    (let (
+        (market-id (try! (create-market title description duration-blocks initial-liquidity)))
+        (oracle-info (unwrap! (map-get? oracles oracle-id) ERR_ORACLE_NOT_FOUND))
+        (validated-key (unwrap! (as-max-len? data-key u128) ERR_INVALID_STRING_LENGTH))
+        (validated-criteria (unwrap! (as-max-len? resolution-criteria u256) ERR_INVALID_STRING_LENGTH))
+    )
+        ;; Validate oracle configuration and market-id
+        (asserts! (> market-id u0) ERR_MARKET_NOT_FOUND) ;; Ensure market creation was successful
+        (asserts! (validate-data-key validated-key) ERR_INVALID_STRING_LENGTH)
+        (asserts! (validate-resolution-criteria validated-criteria) ERR_INVALID_STRING_LENGTH)
+        (asserts! (get active oracle-info) ERR_ORACLE_NOT_AUTHORIZED)
+        
+        ;; Link market to oracle with validated market-id
+        (map-set market-oracles market-id {
+            oracle-id: oracle-id,
+            data-key: validated-key,
+            resolution-criteria: validated-criteria,
+            auto-resolve: auto-resolve
+        })
+        
+        (ok market-id)
+    )
+)
+
+;; Oracle-based market resolution
+(define-public (resolve-market-with-oracle (market-id uint))
+    (let (
+        (market-data (unwrap! (map-get? markets market-id) ERR_MARKET_NOT_FOUND))
+        (oracle-config (unwrap! (map-get? market-oracles market-id) ERR_ORACLE_NOT_FOUND))
+        (config-oracle-id (get oracle-id oracle-config))
+        (config-data-key (get data-key oracle-config))
+        (oracle-info (unwrap! (map-get? oracles config-oracle-id) ERR_ORACLE_NOT_FOUND))
+        (oracle-data-entry (unwrap! (map-get? oracle-data { oracle-id: config-oracle-id, data-key: config-data-key }) ERR_INVALID_ORACLE_DATA))
+        (data-block-height (get block-height oracle-data-entry))
+        (data-age (if (>= stacks-block-height data-block-height) (- stacks-block-height data-block-height) u0))
+        (data-verified (get verified oracle-data-entry))
+        (market-expiry (get expiry-block market-data))
+        (market-resolution-block (get resolution-block market-data))
+        (market-resolved (get resolved market-data))
+        (oracle-operator (get operator oracle-info))
+        (oracle-total-resolutions (get total-resolutions oracle-info))
+    )
+        ;; Validation checks
+        (asserts! (> market-id u0) ERR_MARKET_NOT_FOUND)
+        (asserts! (> stacks-block-height market-expiry) ERR_MARKET_NOT_RESOLVED)
+        (asserts! (< stacks-block-height market-resolution-block) ERR_MARKET_EXPIRED)
+        (asserts! (not market-resolved) ERR_MARKET_ALREADY_RESOLVED)
+        (asserts! data-verified ERR_INVALID_ORACLE_DATA)
+        (asserts! (< data-age ORACLE_DATA_VALIDITY_BLOCKS) ERR_ORACLE_DATA_TOO_OLD)
+        (asserts! (validate-principal oracle-operator) ERR_INVALID_PRINCIPAL)
+        
+        ;; Determine outcome based on oracle data
+        (let (
+            (oracle-value (get value oracle-data-entry))
+            (outcome (is-eq oracle-value "true")) ;; Simple boolean resolution for now
+        )
+            ;; Update market with oracle resolution
+            (map-set markets market-id 
+                (merge market-data {
+                    resolved: true,
+                    outcome: (some outcome),
+                    resolver: (some oracle-operator),
+                    oracle-resolved: true
+                })
+            )
+            
+            ;; Update oracle statistics
+            (map-set oracles config-oracle-id
+                (merge oracle-info {
+                    total-resolutions: (+ oracle-total-resolutions u1)
+                })
+            )
+            
+            (ok outcome)
+        )
+    )
+)
+
+;; Enhanced buy shares function with oracle validation
 (define-public (buy-shares (market-id uint) (bet-yes bool) (amount uint) (minimum-shares uint))
     (let (
         (market-data (unwrap! (map-get? markets market-id) ERR_MARKET_NOT_FOUND))
@@ -224,19 +471,22 @@
         (pool-in (if bet-yes (get yes-pool market-data) (get no-pool market-data)))
         (pool-out (if bet-yes (get no-pool market-data) (get yes-pool market-data)))
         (fee-amount (/ (* amount (var-get platform-fee-rate)) u10000))
-        (net-amount (- amount fee-amount))
+        (net-amount (if (>= amount fee-amount) (- amount fee-amount) u0))
         (shares-out (calculate-shares-internal pool-in pool-out net-amount))
-        (new-yes-pool (if bet-yes (+ (get yes-pool market-data) net-amount) (- (get yes-pool market-data) shares-out)))
-        (new-no-pool (if bet-yes (- (get no-pool market-data) shares-out) (+ (get no-pool market-data) net-amount)))
+        (new-yes-pool (if bet-yes (+ (get yes-pool market-data) net-amount) (if (>= (get yes-pool market-data) shares-out) (- (get yes-pool market-data) shares-out) u0)))
+        (new-no-pool (if bet-yes (if (>= (get no-pool market-data) shares-out) (- (get no-pool market-data) shares-out) u0) (+ (get no-pool market-data) net-amount)))
         (new-k-constant (* new-yes-pool new-no-pool))
     )
         ;; Comprehensive validation
+        (asserts! (> market-id u0) ERR_MARKET_NOT_FOUND)
         (asserts! (validate-amount amount) ERR_INVALID_AMOUNT)
+        (asserts! (validate-principal tx-sender) ERR_INVALID_PRINCIPAL)
         (asserts! (is-market-active market-id) ERR_MARKET_CLOSED)
         (asserts! (> shares-out u0) ERR_INSUFFICIENT_LIQUIDITY)
         (asserts! (>= shares-out minimum-shares) ERR_SLIPPAGE_EXCEEDED)
         (asserts! (> new-yes-pool u0) ERR_INSUFFICIENT_LIQUIDITY)
         (asserts! (> new-no-pool u0) ERR_INSUFFICIENT_LIQUIDITY)
+        (asserts! (>= amount fee-amount) ERR_INVALID_AMOUNT)
         
         ;; Transfer STX from user
         (try! (stx-transfer? amount tx-sender (as-contract tx-sender)))
@@ -284,7 +534,9 @@
         (new-no-pool (+ (get no-pool market-data) amount-per-pool))
         (new-k-constant (* new-yes-pool new-no-pool))
     )
+        (asserts! (> market-id u0) ERR_MARKET_NOT_FOUND)
         (asserts! (validate-amount amount) ERR_INVALID_AMOUNT)
+        (asserts! (validate-principal tx-sender) ERR_INVALID_PRINCIPAL)
         (asserts! (is-market-active market-id) ERR_MARKET_CLOSED)
         (asserts! (is-eq (mod amount u2) u0) ERR_INVALID_AMOUNT) ;; Must be even for balanced liquidity
         
@@ -310,6 +562,8 @@
         (market-data (unwrap! (map-get? markets market-id) ERR_MARKET_NOT_FOUND))
     )
         ;; Validation checks
+        (asserts! (> market-id u0) ERR_MARKET_NOT_FOUND)
+        (asserts! (validate-principal tx-sender) ERR_INVALID_PRINCIPAL)
         (asserts! (not (is-eq tx-sender (get creator market-data))) ERR_CANNOT_RESOLVE_OWN_MARKET)
         (asserts! (> stacks-block-height (get expiry-block market-data)) ERR_MARKET_NOT_RESOLVED)
         (asserts! (< stacks-block-height (get resolution-block market-data)) ERR_MARKET_EXPIRED)
@@ -320,7 +574,8 @@
             (merge market-data {
                 resolved: true,
                 outcome: (some outcome),
-                resolver: (some tx-sender)
+                resolver: (some tx-sender),
+                oracle-resolved: false
             })
         )
         
@@ -341,6 +596,8 @@
                    u0))
     )
         ;; Validation
+        (asserts! (> market-id u0) ERR_MARKET_NOT_FOUND)
+        (asserts! (validate-principal tx-sender) ERR_INVALID_PRINCIPAL)
         (asserts! (get resolved market-data) ERR_MARKET_NOT_RESOLVED)
         (asserts! (> winning-shares u0) ERR_INSUFFICIENT_BALANCE)
         (asserts! (> payout u0) ERR_INSUFFICIENT_BALANCE)
@@ -370,6 +627,7 @@
         (accumulated-fees (default-to u0 (map-get? market-fees market-id)))
     )
         (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_NOT_AUTHORIZED)
+        (asserts! (> market-id u0) ERR_MARKET_NOT_FOUND)
         (asserts! (> accumulated-fees u0) ERR_INSUFFICIENT_BALANCE)
         
         (map-delete market-fees market-id)
