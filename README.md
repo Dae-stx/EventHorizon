@@ -21,6 +21,7 @@ EventHorizon is an advanced decentralized prediction market platform built on th
 - **Price Impact Analysis**: Real-time calculation of trade impact on market prices
 - **Multi-Resolution Support**: Both manual and oracle-based resolution methods
 - **Enhanced Security**: Comprehensive input validation and principal verification
+- **Safe Math Operations**: Overflow protection and division-by-zero prevention
 
 ## 🔧 How It Works
 
@@ -56,6 +57,7 @@ x * y = k (where k remains constant)
 - **Minimum Output**: Guaranteed minimum shares with configurable slippage tolerance
 - **Price Impact Protection**: Prevents excessive market manipulation
 - **Liquidity Constraints**: Minimum liquidity requirements for market stability
+- **Safe Arithmetic**: Protected against overflow and division errors
 
 ## 📡 Oracle System
 
@@ -79,7 +81,7 @@ x * y = k (where k remains constant)
 
 ### Resolution Criteria
 - **Automated Resolution**: Markets can resolve based on oracle data automatically
-- **Data Freshness**: Oracle data must be within validity window (24 hours)
+- **Data Freshness**: Oracle data must be within validity window (24 hours / 144 blocks)
 - **Verification Requirements**: Only verified oracle data can trigger resolutions
 - **Fallback Resolution**: Manual resolution available if oracle fails
 
@@ -135,7 +137,9 @@ x * y = k (where k remains constant)
 ### Platform Parameters
 - **Platform Fee**: 2.5% (250 basis points) on all transactions
 - **Minimum Liquidity**: 100 STX per pool side for market creation
-- **Resolution Window**: 24 hours after market expiry
+- **Minimum Duration**: 144 blocks (~24 hours)
+- **Maximum Duration**: 52,560 blocks (~1 year)
+- **Resolution Window**: 144 blocks (24 hours) after market expiry
 - **Oracle Data Validity**: 144 blocks (~24 hours) for data freshness
 - **Maximum Slippage**: 50% protection limit
 - **Precision**: 1,000,000 units (6 decimal places) for calculations
@@ -147,6 +151,8 @@ x * y = k (where k remains constant)
 - **Conflict Prevention**: Market creators cannot resolve their own markets
 - **Data Integrity**: Timestamp and block-height validation for oracle data
 - **Slippage Protection**: Configurable limits prevent unfavorable trades
+- **Safe Math**: Protected arithmetic operations preventing overflows and division by zero
+- **Duration Limits**: Markets must be within valid timeframe constraints
 
 ### Error Handling
 ```clarity
@@ -157,6 +163,8 @@ ERR_ORACLE_NOT_AUTHORIZED (u115)
 ERR_INVALID_ORACLE_DATA (u117)
 ERR_ORACLE_DATA_TOO_OLD (u118)
 ERR_INVALID_PRINCIPAL (u121)
+ERR_INVALID_DURATION (u122)
+ERR_CALCULATION_ERROR (u123)
 ;; ... and more
 ```
 
@@ -167,9 +175,10 @@ ERR_INVALID_PRINCIPAL (u121)
 - **Amount Validation**: Comprehensive amount and balance checking
 - **Principal Validation**: Enhanced verification of user principals
 - **Oracle Data Validation**: Multi-layer validation for oracle data integrity
+- **Duration Validation**: Market duration must be within acceptable bounds
 
 ### Conflict Prevention
-- **Self-Resolution Protection**: Markets creators cannot resolve their own markets
+- **Self-Resolution Protection**: Market creators cannot resolve their own markets
 - **Oracle Authorization**: Only authorized operators can provide oracle data
 - **Data Freshness**: Oracle data must be recent and verified
 - **Double-Resolution Prevention**: Markets cannot be resolved multiple times
@@ -179,6 +188,7 @@ ERR_INVALID_PRINCIPAL (u121)
 - **Slippage Limits**: Protects users from excessive price impact
 - **Price Impact Calculation**: Transparent pricing impact disclosure
 - **Fee Integration**: Platform fees built into AMM calculations
+- **Safe Calculations**: All math operations protected against overflow/underflow
 
 ## 🚀 Getting Started
 
@@ -225,12 +235,14 @@ ERR_INVALID_PRINCIPAL (u121)
 - **Slippage Protection**: Built-in protection against unfavorable price movements
 - **Oracle Reliability**: Automated resolution reduces counterparty risk
 - **Low Fees**: Competitive 2.5% platform fee structure
+- **Safe Operations**: Protected against calculation errors and exploits
 
 ### For Market Creators
 - **Oracle Integration**: Automated resolution reduces operational overhead
 - **Flexible Configuration**: Customizable market parameters and criteria
 - **Revenue Opportunities**: Earn from initial liquidity provision
 - **Global Reach**: Decentralized platform accessible worldwide
+- **Duration Flexibility**: Create markets from 24 hours to 1 year
 
 ### For Oracle Operators
 - **Revenue Stream**: Earn fees from providing reliable data feeds
@@ -238,12 +250,19 @@ ERR_INVALID_PRINCIPAL (u121)
 - **Technical Integration**: Simple API for data updates and management
 - **Authorization System**: Controlled access ensures data quality
 
-## 🤝 Contributing
+## 🔄 Recent Updates (v2.0)
 
-EventHorizon welcomes contributions to improve the platform's functionality, security, and user experience. Areas for contribution include:
+### Enhanced Safety & Validation
+- ✅ **Safe Math Operations**: Added overflow protection for all arithmetic operations
+- ✅ **Division by Zero Prevention**: Comprehensive checks prevent division errors
+- ✅ **Duration Constraints**: Markets now have min (24h) and max (1 year) duration limits
+- ✅ **Proper Stacks Syntax**: Uses correct `block-height` instead of deprecated syntax
+- ✅ **Calculation Error Handling**: New error code (ERR_CALCULATION_ERROR) for math failures
+- ✅ **Enhanced Input Validation**: All parameters checked before processing
 
-- **Oracle Integration**: New data source integrations
-- **AMM Enhancements**: Advanced pricing mechanisms
-- **Security Audits**: Smart contract security improvements
-- **Documentation**: User guides and technical documentation
-- **Testing**: Comprehensive test suite development
+### Code Quality Improvements
+- ✅ **Clarinet Compatible**: Passes `clarinet check` without warnings
+- ✅ **No Unchecked Data**: All potentially unsafe operations now wrapped in error handling
+- ✅ **Type Safety**: Proper unwrapping of optional values with error propagation
+- ✅ **Consistent Error Handling**: Standardized error responses across all functions
+
